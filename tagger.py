@@ -12,6 +12,7 @@ import torch
 from torch.utils.data import Dataset, TensorDataset, DataLoader, random_split
 import torch.nn as nn
 from torchtext import data
+from torchtext.vocab import Vectors
 import torch.optim as optim
 from math import log, isfinite, inf
 from collections import Counter, defaultdict
@@ -30,8 +31,10 @@ def use_seed(seed=2512021):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
-    torch.set_deterministic(True)
-    # torch.backends.cudnn.deterministic = True
+    try:
+        torch.set_deterministic(True)
+    except:
+        pass
 
 
 # utility functions to read the corpus
@@ -274,17 +277,6 @@ def predict_next_best(tag, emission_prob, predecessor_list, A):
     return best_cell
 
 
-# # a suggestion for a helper function. Not an API requirement
-# def predict_next_best(word, tag, predecessor_list):
-#     """
-#     :param word: The word of the current state
-#     :param tag: The tag of the current state
-#     :param predecessor_list: List of (t, p) where t is the previous tag and p is it's probability
-#     :return: Returns a new item (tupple)
-#     """
-#     for t,r,p in predecessor_list:
-
-
 def joint_prob(sentence, A, B):
     """Returns the joint probability of the given sequence of words and tags under
      the HMM model.
@@ -331,13 +323,10 @@ def joint_prob(sentence, A, B):
 
 
 def get_sentence_indices(seq, to_ix):
-    # idxs = [to_ix.get(w.lower(), 0) for w in seq]
-    # return torch.tensor(idxs, dtype=torch.long)
-    return [to_ix.get(w, 0) for w in seq]
+    return [to_ix.get(w.lower(), 0) for w in seq]
 
 
 def get_case_features(seq):
-    # return torch.tensor([[word.islower(), word.isupper(), word[0].isupper()] for word in seq], dtype=torch.bool)
     return [[word.islower(), word.isupper(), word[0].isupper()] for word in seq]
 
 
@@ -351,7 +340,7 @@ def prepare_data(data, word_to_idx, tag_to_idx, max_seq_len, input_rep=0, train=
         sentence_tags = []
         for token in sentence:
             word = token[0] if train else token
-            sentence_features.append([word_to_idx.get(word, 0)] + (
+            sentence_features.append([word_to_idx.get(word.lower(), 0)] + (
                 [word.islower(), word.isupper(), word[0].isupper()] if input_rep else []))
             if train:
                 tag = token[1]
@@ -360,7 +349,7 @@ def prepare_data(data, word_to_idx, tag_to_idx, max_seq_len, input_rep=0, train=
         if train:
             sentences_tag_indices.append(sentence_tags)
 
-    return sentences_word_features, sentences_tag_indices
+    return (sentences_word_features, sentences_tag_indices) if train else sentences_word_features
 
 
 def loss_batch(model, loss_func, xb, yb, opt=None):
@@ -373,9 +362,9 @@ def loss_batch(model, loss_func, xb, yb, opt=None):
     :param opt: The optimizer to perform the backprop with, defaults to None which means no backprop will be performed
     :return: The loss for the given batch
     """
-    y_pred = model(xb)
-    y_pred = y_pred.reshape(-1, y_pred.shape[-1])
-    yb = yb.reshape(-1)
+    y_pred = model(xb.to(device))
+    y_pred = y_pred.reshape(-1, y_pred.shape[-1]).to(device)
+    yb = yb.reshape(-1).to(device)
     loss = loss_func(y_pred, yb.long())
 
     # If not none, update the weights using the back-propagation algorithm
@@ -389,13 +378,14 @@ def loss_batch(model, loss_func, xb, yb, opt=None):
 
 class BiLSTMTagger(nn.Module):
     def __init__(self, max_vocab_size, embedding_dimension, num_of_layers, output_dimension, min_frequency, input_rep,
-                 pretrained_embeddings_fn, data_fn, max_seq_len=None, hidden_dim=64, proj_size=None, dropout=0.1):
+                 pretrained_embeddings_fn, data_fn, max_seq_len=None, hidden_dim=256, dropout=0.25):
         super().__init__()
         # self.max_vocab_size = max_vocab_size
         # self.min_frequency = min_frequency
         self.input_rep = input_rep
         # proj_size = hidden_dim if proj_size is None else proj_size
-        self.lstm = nn.LSTM(input_size=embedding_dimension + 3 * input_rep, hidden_size=hidden_dim, num_layers=num_of_layers,
+        self.lstm = nn.LSTM(input_size=embedding_dimension + 3 * input_rep, hidden_size=hidden_dim,
+                            num_layers=num_of_layers,
                             # proj_size=proj_size,
                             bidirectional=True, dropout=dropout, batch_first=True)
         self.softmax = nn.Softmax(2)
@@ -421,17 +411,13 @@ class BiLSTMTagger(nn.Module):
 
         self.idx_to_tag = {v: k for k, v in self.tag_to_idx.items()}
 
-        vectors = load_pretrained_embeddings(pretrained_embeddings_fn, vocab)
-
-        pretrained_embeddings = vectors['weights']
-        self.word_to_idx = vectors['word_to_idx']
-
-        self.idx_to_word = {v: k for k, v in self.word_to_idx.items()}
+        pretrained_embeddings, self.word_to_idx, self.idx_to_word = load_pretrained_embeddings(pretrained_embeddings_fn,
+                                                                                               vocab)
 
         if pretrained_embeddings_fn is not None:
             self.embedding = nn.Embedding.from_pretrained(pretrained_embeddings, freeze=True)
         else:
-            self.embedding = nn.Embedding(max_vocab_size, embedding_dim)
+            self.embedding = nn.Embedding(len(vocab) if max_vocab_size==-1 else max_vocab_size, embedding_dim)
 
         self.hidden2tag = nn.Linear(2 * hidden_dim, output_dimension + 1)
 
@@ -441,7 +427,8 @@ class BiLSTMTagger(nn.Module):
         x = torch.cat((embeds, inp[:, :, 1:]), dim=2) if self.input_rep else embeds
         lstm_out, _ = self.lstm(x)
         tag_space = self.hidden2tag(lstm_out)
-        return self.softmax(tag_space)
+        return tag_space
+        # return self.softmax(tag_space)
 
 
 def initialize_rnn_model(params_d):
@@ -485,8 +472,6 @@ def initialize_rnn_model(params_d):
         #to the returned dict
     """
 
-    # TODO complete the code
-
     model = {'lstm': BiLSTMTagger(**params_d), 'input_rep': params_d['input_rep']}
 
     return model
@@ -507,24 +492,27 @@ def load_pretrained_embeddings(path, vocab=None):
         vocab (list): a list of words to have embeddings for. Defaults to None.
 
     """
-    word_to_idx = {UNK: 0}
-    weights = defaultdict(lambda: [0.0] * 100)
-    weights[0] = [0.0] * 100
 
-    with open(path, 'rb') as f:
-        idx = 1  # starting index
-        for l in f.readlines():
-            line = l.decode().strip().split()
-            word = line[0]
-            if vocab is None or word in vocab:
-                weights[idx] = list(map(float, line[1:]))
-                word_to_idx[word] = idx
-                idx += 1
-    vectors = {'word_to_idx': word_to_idx, 'weights': torch.Tensor(list(weights.values()))}
-    return vectors
+    vectors = Vectors(name=path)
+    weights = vectors.vectors
+    stoi = vectors.stoi
+    itos = vectors.itos
+    if vocab is None:
+        vectors.stoi[UNK] = len(vectors.stoi)
+        vectors.itos[len(vectors.itos)] = UNK
+    else:
+        weights = vectors.get_vecs_by_tokens(vocab)
+        weights = torch.cat([torch.zeros(weights.shape[1:]).unsqueeze(0), weights], dim=0)
+        stoi = {UNK: 0}
+        itos = {0: UNK}
+        for idx, w in enumerate(vocab):
+            stoi[w] = idx + 1
+            itos[idx + 1] = w
+
+    return weights, stoi, itos
 
 
-def train_rnn(model, train_data, val_data=None):
+def train_rnn(model, train_data, val_data=None, verbose=0, bs=128, epochs=20, lr=1e-3):
     """Trains the BiLSTM model on the specified data.
 
     Args:
@@ -536,6 +524,9 @@ def train_rnn(model, train_data, val_data=None):
                             Defaults to None
         input_rep (int): sets the input representation. Defaults to 0 (vanilla),
                          1: case-base; <other int>: other models, if you are playful
+        verbose (int): Whether to print to console or not
+        bs (int): Batch size of the
+        epochs(int): Number of training epochs
     """
     # Tips:
     # 1. you have to specify an optimizer
@@ -544,19 +535,14 @@ def train_rnn(model, train_data, val_data=None):
     # 4. some of the above could be implemented in helper functions (not part of
     #    the required API)
 
-    # TODO complete the code
-
     bilstm_model = model['lstm']
     input_rep = model['input_rep']
 
     criterion = nn.CrossEntropyLoss()  # you can set the parameters as you like
-    optimizer = optim.Adam(bilstm_model.parameters())
+    optimizer = optim.Adam(bilstm_model.parameters(), lr=lr)
 
     bilstm_model: BiLSTMTagger = bilstm_model.to(device)
     criterion = criterion.to(device)
-
-    epochs = 5
-    bs = 32
 
     if not val_data:
         # np.random.shuffle(train_data)
@@ -564,10 +550,6 @@ def train_rnn(model, train_data, val_data=None):
                                             max_seq_len=bilstm_model.max_seq_len,
                                             input_rep=input_rep)
         train_bound = round(len(train_data) * 0.8)
-        # torch.utils.data.random_split()
-        # X_train, y_train = torch.Tensor(words[:train_bound]), torch.Tensor(tags[:train_bound])
-        # X_val, y_val = torch.Tensor(words[train_bound:]), torch.Tensor(tags[train_bound:])
-        # X, y = torch.LongTensor(words_features), torch.LongTensor(tags)
         dataset = TensorDataset(torch.LongTensor(words_features), torch.LongTensor(tags))
         train_ds, val_ds = torch.utils.data.random_split(dataset,
                                                          [train_bound, len(train_data) - train_bound])
@@ -586,11 +568,9 @@ def train_rnn(model, train_data, val_data=None):
 
     val_dl = DataLoader(val_ds, batch_size=bs, shuffle=True)
 
-    verbose = 1
-
     best_loss = float('inf')
 
-    PATH = "model2.pt"
+    path = f"model_input_rep_{input_rep}.pt"
 
     for epoch in range(epochs):
         bilstm_model.train()
@@ -605,14 +585,12 @@ def train_rnn(model, train_data, val_data=None):
             if verbose:
                 val_loss = np.sum(np.multiply(losses, nums)) / np.sum(nums)
                 if val_loss < best_loss:
-                    torch.save({
-                        'epoch': epoch,
-                        'model_state_dict': bilstm_model.state_dict(),
-                        'optimizer_state_dict': optimizer.state_dict(),
-                        'loss': val_loss,
-                    }, PATH)
+                    torch.save(bilstm_model.state_dict(), path)
                     best_loss = val_loss
-                print(epoch, val_loss)
+                if verbose:
+                    print(epoch, val_loss)
+
+    bilstm_model.load_state_dict(torch.load(path))
 
 
 def rnn_tag_sentence(sentence, model):
@@ -634,9 +612,11 @@ def rnn_tag_sentence(sentence, model):
     input_rep = model['input_rep']
 
     # pad the sentence:
-    X = get_sentence_indices(sentence + [EOS], to_ix=bilstm_model.word_to_idx)
+    X = torch.LongTensor(
+        prepare_data([sentence + [EOS]], bilstm_model.word_to_idx, bilstm_model.tag_to_idx, bilstm_model.max_seq_len,
+                     input_rep, False))
 
-    predictions = bilstm_model(X.reshape(1, -1).to(device))
+    predictions = bilstm_model(X.to(device))
     tags_indices = torch.argmax(predictions, dim=-1).reshape(-1)
     tags = [bilstm_model.idx_to_tag.get(int(idx), UNK) for idx in tags_indices]
     tags = tags[:len(sentence)]
@@ -654,14 +634,10 @@ def get_best_performing_model_params():
                initialize_rnn_model() and train_lstm()
     """
 
-    model_params = {'max_vocab_size': -1,
-                    'min_frequency': 2,
-                    'input_rep': 1,
-                    'embedding_dimension': 100,
-                    'num_of_layers': 3,
-                    'output_dimension': 17,
-                    'pretrained_embeddings_fn': 'glove.6B.100d.txt',
-                    'data_fn': 'en-ud-train.upos.tsv'
+    model_params = {'embedding_dimension': 100, 'max_vocab_size': -1, 'num_of_layers': 3,
+                  'output_dimension': 17, 'min_frequency': 2, 'input_rep': 1,
+                  'pretrained_embeddings_fn': 'glove.6B.100d.txt', 'data_fn': 'en-ud-train.upos.tsv',
+                  # 'dropout': 0.25, 'hidden_dim': 256,
                     }
 
     return model_params

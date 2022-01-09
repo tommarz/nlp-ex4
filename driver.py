@@ -1,41 +1,58 @@
-import tagger
+from tagger import *
 from collections import defaultdict
 import torch
 
 if __name__ == '__main__':
-    train = tagger.load_annotated_corpus('en-ud-train.upos.tsv')
-    test = tagger.load_annotated_corpus('en-ud-dev.upos.tsv')
 
-    allTagCounts, perWordTagCounts, transitionCounts, emissionCounts, A, B = tagger.learn_params(train)
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-    model_dict = {'embedding_dimension': 100, 'hidden_dim': 256, 'max_vocab_size': 5000, 'num_of_layers': 1,
-                  'output_dimension': len(allTagCounts), 'min_frequency': 10, 'input_rep': 1,
-                  'pretrained_embeddings_fn': 'glove.6B.100d.txt', 'data_fn': 'en-ud-train.upos.tsv', 'dropout': 0.0}
+    print(device)
 
-    # model_dict = tagger.get_best_performing_model_params()
+    use_seed()
 
-    # model_dict['input_rep'] = 0
+    train = load_annotated_corpus('en-ud-train.upos.tsv')
+    test = load_annotated_corpus('en-ud-dev.upos.tsv')
 
-    model = tagger.initialize_rnn_model(model_dict)
+    allTagCounts, perWordTagCounts, transitionCounts, emissionCounts, A, B = learn_params(train)
 
-    # PATH = 'model2.pt'
-    #
-    # checkpoint = torch.load(PATH)
-    # model['lstm'].load_state_dict(checkpoint['model_state_dict'])
+    model_dict = get_best_performing_model_params()
 
-    tagger.train_rnn(model, train)
+    print('BiLSTM+case')
 
-    models = {'baseline': [perWordTagCounts, allTagCounts], 'hmm': [A, B], 'blstm': [model]}
-    accuracy_dict = {k: defaultdict(int) for k in models}
-    for i in range(len(test)):
-        for name, model in models.items():
-            raw_sentence = test[i]
+    cblstm = initialize_rnn_model(model_dict)
+
+    # train_rnn(cblstm, train, verbose=1, bs=128)
+    # Load pretrained model
+
+    PATH = 'model_input_rep_1.pt'
+    checkpoint = torch.load(PATH)
+    cblstm['lstm'].load_state_dict(checkpoint)
+    cblstm['lstm'] = cblstm['lstm'].to(device)
+
+    # Train Vanilla BiLSTM
+
+    model_dict['input_rep'] = 0
+
+    blstm = initialize_rnn_model(model_dict)
+
+    # Train BiLSTM+case
+
+    # train_rnn(blstm, train, verbose=1, bs=128)
+
+    PATH = 'model_input_rep_0.pt'
+    checkpoint = torch.load(PATH)
+    blstm['lstm'].load_state_dict(checkpoint)
+    blstm['lstm'] = blstm['lstm'].to(device)
+
+    models = {'baseline': [perWordTagCounts, allTagCounts], 'hmm': [A, B], 'blstm': [blstm], 'cblstm': [cblstm]}
+    accuracy_dict = defaultdict(int)
+    for name, model in models.items():
+        total_correct = 0
+        total_words = 0
+        for raw_sentence in test:
             sentence = [x[0] for x in raw_sentence]
-
-            tagged_sentence = tagger.tag_sentence(sentence, {name: model})
-            correct, correctOOV, OOV = tagger.count_correct(raw_sentence, tagged_sentence)
-            accuracy = round(correct / len(sentence), 3)
-            accuracy_dict[name][i] = accuracy
-    for k in accuracy_dict:
-        accuracy_dict[k] = round(sum(accuracy_dict[k].values()) / len(test), 3)
-    print(f'Total accuracy: {accuracy_dict}')
+            tagged_sentence = tag_sentence(sentence, {name: model})
+            correct, correctOOV, OOV = count_correct(raw_sentence, tagged_sentence)
+            total_correct += correct
+            total_words += len(sentence)
+        print(f'{name} : {round(total_correct / total_words, 3)}')
